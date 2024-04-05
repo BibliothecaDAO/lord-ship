@@ -1,18 +1,33 @@
 // TODO: SRC5
-//       getters for storage vars
 //       compare VotingYFI with veANGLE.vy & crv VotingEscrow.vy
 //       test suite
+//       validate input args
 
 // TODO: in VotingYFI/veANGLE it's LockedBalance.amount is int128, why? why not uint128?
 //       we're using uint128, can the locked balance be negative?
 
 // TODO: doc comments everywhere
 
-// TODO: packing
-#[derive(Copy, Default, Drop, Serde, starknet::Store)]
+const TWO_POW_64: felt252 = 0x10000000000000000;
+const TWO_POW_128: felt252 = 0x100000000000000000000000000000000;
+
+#[derive(Copy, Default, Drop, Serde)]
 pub struct Lock {
     pub amount: u128,
     pub end_time: u64,
+}
+
+impl LockPacking of starknet::storage_access::StorePacking<Lock, felt252> {
+    fn pack(value: Lock) -> felt252 {
+        value.amount.into() + (value.end_time.into() * TWO_POW_128)
+    }
+
+    fn unpack(value: felt252) -> Lock {
+        let shift: u256 = TWO_POW_128.into();
+        let shift: NonZero<u256> = shift.try_into().unwrap();
+        let (end_time, amount) = core::traits::DivRem::div_rem(value.into(), shift);
+        Lock { amount: amount.try_into().unwrap(), end_time: end_time.try_into().unwrap() }
+    }
 }
 
 #[derive(Copy, Drop, Serde, starknet::Store)]
@@ -23,13 +38,12 @@ pub struct Point {
     pub block: u64
 }
 
-// TODO: rm once signed integers defaults are in Cairo
+// TODO: rm once signed integers defaults are in Cairo, prob. 2.7.0
 impl PointDefault of Default<Point> {
     fn default() -> Point {
         Point { bias: 0, slope: 0, ts: 0, block: 0 }
     }
 }
-
 
 #[starknet::contract]
 mod velords {
@@ -40,7 +54,10 @@ mod velords {
     use openzeppelin::access::ownable::OwnableComponent;
     use openzeppelin::upgrades::UpgradeableComponent;
     use openzeppelin::upgrades::interface::IUpgradeable;
-    use starknet::{ClassHash, ContractAddress, contract_address_const, get_caller_address, get_block_number, get_block_timestamp, get_contract_address};
+    use starknet::{
+        ClassHash, ContractAddress, contract_address_const, get_caller_address, get_block_number, get_block_timestamp,
+        get_contract_address
+    };
     use super::{Lock, Point};
 
     const LORDS_TOKEN: felt252 = 0x124aeb495b947201f5fac96fd1138e326ad86195b98df6dec9009158a533b49;
@@ -65,36 +82,75 @@ mod velords {
         ownable: OwnableComponent::Storage,
         #[substorage(v0)]
         upgradeable: UpgradeableComponent::Storage,
-
         // TODO: better docstrings
 
         balances: LegacyMap<ContractAddress, u256>,
         supply: u128,
-
         // owner -> lock details
         locked: LegacyMap<ContractAddress, Lock>,
         // 0,1,2...
         epoch: LegacyMap<ContractAddress, u64>,
         // (address, epoch) -> Point
         point_history: LegacyMap<(ContractAddress, u64), Point>,
-        // (address, epoch) -> signed slope change
+        // (address, ts) -> signed slope change
         slope_changes: LegacyMap<(ContractAddress, u64), i128>,
     }
 
     #[event]
     #[derive(Drop, starknet::Event)]
-    enum Event {
+    pub enum Event {
         #[flat]
         OwnableEvent: OwnableComponent::Event,
         #[flat]
-        UpgradeableEvent: UpgradeableComponent::Event
+        UpgradeableEvent: UpgradeableComponent::Event,
+        ModifyLock: ModifyLock,
+        Withdraw: Withdraw,
+        Penalty: Penalty,
+        Supply: Supply
     }
 
-    // TODO: events
+    // TODO: do we need block_timestamp in the events? isn't that redundant?
+
+    #[derive(Drop, starknet::Event)]
+    pub struct ModifyLock {
+        #[key]
+        pub caller: ContractAddress,
+        #[key]
+        pub owner: ContractAddress,
+        amount: u128,
+        end_time: u64,
+        block_timestamp: u64
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct Withdraw {
+        #[key]
+        pub caller: ContractAddress,
+        amount: u128,
+        block_timestamp: u64
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct Penalty {
+        #[key]
+        pub caller: ContractAddress,
+        amount: u128,
+        block_timestamp: u64
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct Supply {
+        old_amount: u128,
+        new_amount: u128,
+        block_timestamp: u64
+    }
 
     #[constructor]
     fn constructor(ref self: ContractState, owner: ContractAddress) {
         self.ownable.initializer(owner);
+
+        let point = Point { bias: 0, slope: 0, ts: get_block_timestamp(), block: get_block_number() };
+        self.point_history.write((get_contract_address(), 0), point);
     }
 
     #[abi(embed_v0)]
@@ -120,8 +176,7 @@ mod velords {
         }
 
         fn total_supply(self: @ContractState) -> u256 {
-            //self.supply.read().into()
-            self.balance_of_at(get_contract_address(), get_block_timestamp()) // TODO: verify, is this correct?
+            self.balance_of_at(get_contract_address(), get_block_timestamp())
         }
 
         fn totalSupply(self: @ContractState) -> u256 {
@@ -137,7 +192,7 @@ mod velords {
         }
 
         //
-        // ve tokens are not transferable
+        // ve tokens are non-transferable
         //
         fn allowance(self: @ContractState, owner: ContractAddress, spender: ContractAddress) -> u256 {
             0
@@ -148,20 +203,28 @@ mod velords {
         }
 
         fn transfer(ref self: ContractState, recipient: ContractAddress, amount: u256) -> bool {
-            panic!("veLORDS are not transferable")
+            panic!("veLORDS are non-transferable")
         }
 
-        fn transfer_from(ref self: ContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256) -> bool {
-            panic!("veLORDS are not transferable")
+        fn transfer_from(
+            ref self: ContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256
+        ) -> bool {
+            panic!("veLORDS are non-transferable")
         }
 
-        fn transferFrom(ref self: ContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256) -> bool {
-            panic!("veLORDS are not transferable")
+        fn transferFrom(
+            ref self: ContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256
+        ) -> bool {
+            panic!("veLORDS are non-transferable")
         }
     }
 
     #[abi(embed_v0)]
     impl IVEImpl of IVE<ContractState> {
+        fn get_epoch_for(self: @ContractState, owner: ContractAddress) -> u64 {
+            self.epoch.read(owner)
+        }
+
         fn get_lock_for(self: @ContractState, owner: ContractAddress) -> Lock {
             self.locked.read(owner)
         }
@@ -170,6 +233,46 @@ mod velords {
         fn get_last_point(self: @ContractState, owner: ContractAddress) -> Point {
             let epoch: u64 = self.epoch.read(owner);
             self.point_history.read((owner, epoch))
+        }
+
+        fn get_point_for_at(self: @ContractState, owner: ContractAddress, epoch: u64) -> Point {
+            self.point_history.read((owner, epoch))
+        }
+
+        fn get_prior_votes(self: @ContractState, owner: ContractAddress, height: u64) -> u256 {
+            assert!(height <= get_block_number(), "height must be less than or equal to current block number");
+
+            let uepoch: u64 = self.find_epoch_by_block_internal(owner, height, self.epoch.read(owner));
+            let upoint: Point = self.point_history.read((owner, uepoch));
+
+            let this: ContractAddress = get_contract_address();
+            let max_epoch: u64 = self.epoch.read(this);
+            let epoch: u64 = self.find_epoch_by_block_internal(this, height, max_epoch);
+            let point0: Point = self.point_history.read((this, epoch));
+
+            let mut dblock: u64 = 0;
+            let mut dt: u64 = 0;
+            if epoch < max_epoch {
+                let point1: Point = self.point_history.read((this, epoch + 1));
+                dblock = point1.block - point0.block;
+                dt = point1.ts - point0.ts;
+            } else {
+                dblock = get_block_number() - point0.block;
+                dt = get_block_timestamp() - point0.ts;
+            }
+
+            let mut block_time: u64 = point0.ts;
+            if dblock.is_non_zero() {
+                block_time += dt * (height - point0.block) / dblock;
+            }
+
+            let upoint = self.replay_slope_changes(owner, @upoint, block_time);
+            let balance: u128 = upoint.bias.try_into().expect('point bias negative');
+            balance.into()
+        }
+
+        fn get_slope_change(self: @ContractState, owner: ContractAddress, ts: u64) -> i128 {
+            self.slope_changes.read((owner, ts))
         }
 
         fn find_epoch_by_timestamp(self: @ContractState, owner: ContractAddress, ts: u64) -> u64 {
@@ -189,6 +292,33 @@ mod velords {
             let upoint: Point = self.replay_slope_changes(owner, @upoint, ts);
             let balance: u128 = upoint.bias.try_into().expect('point bias negative');
             balance.into()
+        }
+
+        fn total_supply_at(self: @ContractState, height: u64) -> u256 {
+            let current_block: u64 = get_block_number();
+            assert!(height <= current_block, "height must be less than or equal to current block number");
+
+            let this: ContractAddress = get_contract_address();
+            let epoch: u64 = self.epoch.read(this);
+            let target_epoch: u64 = self.find_epoch_by_block_internal(this, height, epoch);
+            let point: Point = self.point_history.read((this, target_epoch));
+
+            let mut dt: u64 = 0;
+            if target_epoch < epoch {
+                let next_point: Point = self.point_history.read((this, target_epoch + 1));
+                if point.block != next_point.block {
+                    dt = (height - point.block) * (next_point.ts - point.ts) / (next_point.block - point.block);
+                }
+            } else {
+                if point.block != current_block {
+                    dt = (height - point.block) * (current_block - point.ts) / (current_block - point.block);
+                }
+            }
+
+            // dt contains info on how far are we beyond point
+            let point = self.replay_slope_changes(this, @point, point.ts + dt);
+            let supply: u128 = point.bias.try_into().expect('point bias negative');
+            supply.into()
         }
 
         // create or modify a lock for a user
@@ -223,7 +353,8 @@ mod velords {
                 assert!(old_lock.end_time > now, "cannot modify an expired lock");
             }
 
-            self.supply.write(self.supply.read() + amount);
+            let old_supply: u128 = self.supply.read();
+            self.supply.write(old_supply + amount);
             self.locked.write(owner, new_lock);
 
             self.checkpoint_internal(owner, @old_lock, @new_lock);
@@ -232,7 +363,8 @@ mod velords {
                 LORDS().transfer_from(caller, get_contract_address(), amount.into());
             }
 
-            // TODO: emit events
+            self.emit(Supply { old_amount: old_supply, new_amount: old_supply + amount, block_timestamp: now });
+            self.emit(ModifyLock { caller, owner, amount: new_lock.amount, end_time: new_lock.end_time, block_timestamp: now });
         }
 
         fn checkpoint(ref self: ContractState) {
@@ -253,8 +385,8 @@ mod velords {
                 0
             };
 
-            let supply = self.supply.read();
-            self.supply.write(supply - locked.amount);
+            let old_supply = self.supply.read();
+            self.supply.write(old_supply - locked.amount);
             self.locked.write(caller, Default::default());
 
             self.checkpoint_internal(caller, @locked, @Default::default());
@@ -262,11 +394,15 @@ mod velords {
             // transfer
             LORDS().transfer(caller, (locked.amount - penalty).into());
             // if penalty.is_non_zero() {
-                // VotingYFI burns penalty here, figure out
-                // if we want to do the same - what's REWARD_POOL for?
+            // VotingYFI burns penalty here, figure out
+            // if we want to do the same - what's REWARD_POOL for?
+            //    reward pool is a pool for early exit penalties
+            //    when adding, also add a getter for it
+            //    TODO: emit Penalty
             // }
 
-            // TODO: emit
+            self.emit(Withdraw { caller, amount: locked.amount - penalty, block_timestamp: now });
+            self.emit(Supply { old_amount: old_supply, new_amount: old_supply - locked.amount, block_timestamp: now });
 
             (locked.amount - penalty, penalty)
         }
@@ -274,12 +410,38 @@ mod velords {
 
     #[generate_trait]
     impl InternalHelpers of InternalHelpersTrait {
-        fn find_epoch_by_timestamp_internal(self: @ContractState, owner: ContractAddress, ts: u64, max_epoch: u64) -> u64 {
+        fn find_epoch_by_block_internal(
+            self: @ContractState, owner: ContractAddress, height: u64, max_epoch: u64
+        ) -> u64 {
             let mut min: u64 = 0;
             let mut max: u64 = max_epoch;
-            loop { // TODO: is this loop guaranteed to terminate? the VotingYFI does 128 iterations
+            let mut i: u64 = 0;
+
+            while i <= 128 { // will be always enough
                 if min >= max {
-                    break min;
+                    break;
+                }
+                let mid: u64 = (min + max + 1) / 2;
+                if self.point_history.read((owner, mid)).block <= height {
+                    min = mid;
+                } else {
+                    max = mid - 1;
+                }
+                i += 1;
+            };
+            min
+        }
+
+        fn find_epoch_by_timestamp_internal(
+            self: @ContractState, owner: ContractAddress, ts: u64, max_epoch: u64
+        ) -> u64 {
+            let mut min: u64 = 0;
+            let mut max: u64 = max_epoch;
+            let mut i: u64 = 0;
+
+            while i <= 128 { // will be always enough
+                if min >= max {
+                    break;
                 }
 
                 let mid: u64 = (min + max + 1) / 2;
@@ -288,7 +450,9 @@ mod velords {
                 } else {
                     max = mid - 1;
                 }
-            }
+                i += 1;
+            };
+            min
         }
 
         // record global and per user data to checkpoint
@@ -316,7 +480,9 @@ mod velords {
             self.point_history.write((this, epoch), last_point);
         }
 
-        fn checkpoint_owner(ref self: ContractState, owner: ContractAddress, old_lock: @Lock, new_lock: @Lock) -> (Point, Point) {
+        fn checkpoint_owner(
+            ref self: ContractState, owner: ContractAddress, old_lock: @Lock, new_lock: @Lock
+        ) -> (Point, Point) {
             // we don't use kinks like in VotingYFI, because the lock period is capped at 4 years
 
             let mut old_point: Point = self.lock_to_point(old_lock);
@@ -438,9 +604,6 @@ mod velords {
     }
 
     fn LORDS() -> IERC20Dispatcher {
-        IERC20Dispatcher {
-            contract_address:
-                contract_address_const::<LORDS_TOKEN>()
-        }
+        IERC20Dispatcher { contract_address: contract_address_const::<LORDS_TOKEN>() }
     }
 }

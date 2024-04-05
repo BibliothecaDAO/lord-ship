@@ -1,3 +1,4 @@
+mod velords;
 pub mod interfaces {
     pub mod IERC20;
     pub mod IVE;
@@ -7,8 +8,6 @@ pub mod interfaces {
 pub mod mocks {
     pub mod erc20;
 }
-
-mod velords;
 
 #[cfg(test)]
 mod tests {

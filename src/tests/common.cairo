@@ -1,6 +1,6 @@
 use core::serde::Serde;
-use lordship::interfaces::IVE::{IVEDispatcher, IVEDispatcherTrait};
 use lordship::interfaces::IERC20::{IERC20Dispatcher, IERC20DispatcherTrait};
+use lordship::interfaces::IVE::{IVEDispatcher, IVEDispatcherTrait};
 use snforge_std::{ContractClass, ContractClassTrait, CheatTarget, declare, start_prank, start_warp, stop_prank};
 use starknet::{ContractAddress, contract_address_const};
 
@@ -49,9 +49,7 @@ pub fn deploy_lords() -> ContractAddress {
 
 pub fn deploy_velords() -> ContractAddress {
     let cls = declare("velords");
-    let calldata: Array<felt252> = array![
-        velords_owner().into()
-    ];
+    let calldata: Array<felt252> = array![velords_owner().into()];
     cls.deploy(@calldata).expect('velords deploy failed')
 }
 

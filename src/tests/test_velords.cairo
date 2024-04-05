@@ -1,10 +1,22 @@
-use openzeppelin::access::ownable::interface::{IOwnableDispatcher, IOwnableDispatcherTrait};
 use lordship::interfaces::IERC20::{IERC20Dispatcher, IERC20DispatcherTrait};
 use lordship::interfaces::IVE::{IVEDispatcher, IVEDispatcherTrait};
 use lordship::tests::common;
 use lordship::velords::Lock;
+use openzeppelin::access::ownable::interface::{IOwnableDispatcher, IOwnableDispatcherTrait};
 use snforge_std::{load, start_prank, start_warp, stop_prank, CheatTarget};
 use starknet::{ContractAddress, Store, get_block_timestamp};
+use starknet::storage_access::StorePacking;
+
+#[test]
+fn test_lock_packing() {
+    let amount: u128 = 0x100000000000000000000;
+    let end_time: u64 = 1700000000;
+    let lock = Lock { amount, end_time };
+    let packed: felt252 = StorePacking::pack(lock);
+    let unpacked: Lock = StorePacking::unpack(packed);
+    assert!(lock.amount == unpacked.amount, "amount mismatch");
+    assert!(lock.end_time == unpacked.end_time, "end time mismatch");
+}
 
 #[test]
 fn test_velords_setup() {
@@ -75,8 +87,7 @@ fn test_create_new_lock_pass() {
     let lock: Lock = velords.get_lock_for(blobert);
     assert_eq!(lock.amount, lock_amount.try_into().unwrap(), "lock amount mismatch");
     assert_eq!(lock.end_time, common::floor_to_week(unlock_time), "unlock time mismatch");
-
-    // TODO: test events
+// TODO: test events
 }
 
 #[test]
@@ -173,11 +184,10 @@ fn test_create_new_lock_for_others_fail() {
 
     velords.manage_lock(lock_amount, unlock_time, blobert);
 }
-
-    // test modifying lock
-    //   pass w/ new amount and new time
-    //   fail when shortening lock time
-    //   fail modifying expired
-    //   pass when modifying amount for someone else
-    //   fail when modifying time for someone else
-    //   fail on expired
+// test modifying lock
+//   pass w/ new amount and new time
+//   fail when shortening lock time
+//   fail modifying expired
+//   pass when modifying amount for someone else
+//   fail when modifying time for someone else
+//   fail on expired

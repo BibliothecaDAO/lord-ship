@@ -35,11 +35,7 @@ mod erc20 {
     /// Mints `fixed_supply` tokens to `recipient`.
     #[constructor]
     fn constructor(
-        ref self: ContractState,
-        name: ByteArray,
-        symbol: ByteArray,
-        fixed_supply: u256,
-        recipient: ContractAddress
+        ref self: ContractState, name: ByteArray, symbol: ByteArray, fixed_supply: u256, recipient: ContractAddress
     ) {
         self.erc20.initializer(name, symbol);
         self.erc20._mint(recipient, fixed_supply);
