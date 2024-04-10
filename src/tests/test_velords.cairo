@@ -1,6 +1,7 @@
 use lordship::interfaces::IERC20::{IERC20Dispatcher, IERC20DispatcherTrait};
 use lordship::interfaces::IVE::{IVEDispatcher, IVEDispatcherTrait};
 use lordship::tests::common;
+use lordship::tests::common::assert_approx;
 use lordship::velords::Lock;
 use openzeppelin::access::ownable::interface::{IOwnableDispatcher, IOwnableDispatcherTrait};
 use snforge_std::{load, start_prank, start_warp, stop_prank, CheatTarget};
@@ -31,7 +32,7 @@ fn test_velords_setup() {
 }
 
 #[test]
-#[should_panic(expected: "veLORDS are not transferable")]
+#[should_panic(expected: "veLORDS are non-transferable")]
 fn test_velords_non_transferable() {
     let velords = IERC20Dispatcher { contract_address: common::deploy_velords() };
     let owner: ContractAddress = common::velords_owner();
@@ -44,35 +45,21 @@ fn test_velords_non_transferable() {
     velords.transfer(spender, 1); // should panic
 }
 
-// TODO:
-// test create new lock pass
-// fail creating for others
-// fail creating when amount == 0
-// fail creating when unlock time is 0
-// more...
-
 #[test]
 fn test_create_new_lock_pass() {
     let (velords, lords) = common::velords_setup();
     let velords_token = IERC20Dispatcher { contract_address: velords.contract_address };
-
     let blobert: ContractAddress = common::blobert();
+    common::setup_for_blobert(lords.contract_address, velords.contract_address);
+
     let balance: u256 = 10_000_000 * common::ONE;
-
-    common::fund_lords(blobert, Option::Some(balance));
-
     let lock_amount: u256 = 2_000_000 * common::ONE;
     let now = get_block_timestamp();
     let unlock_time: u64 = now + common::YEAR;
 
-    // blobert allows veLords contract to transfer its LORDS
-    start_prank(CheatTarget::One(lords.contract_address), blobert);
-    lords.approve(velords.contract_address, lock_amount);
-    stop_prank(CheatTarget::One(lords.contract_address));
-
     // sanity checks
     assert_eq!(lords.balance_of(blobert), balance, "balance mismatch");
-    assert_eq!(lords.allowance(blobert, velords.contract_address), lock_amount, "allowance mismatch");
+    assert_eq!(lords.allowance(blobert, velords.contract_address), balance, "allowance mismatch");
     assert_eq!(velords_token.total_supply(), 0, "total supply mismatch");
 
     // blobert locks 2M LORDS for 1 year
@@ -80,45 +67,44 @@ fn test_create_new_lock_pass() {
     velords.manage_lock(lock_amount, unlock_time, blobert);
 
     assert_eq!(lords.balance_of(blobert), balance - lock_amount, "LORDS balance mismatch after locking");
-    assert_eq!(velords_token.total_supply(), lock_amount, "total supply mismatch after locking");
-    // TODO
-    // assert_eq!(velords_token.balance_of(blobert), lock_amount, "veLORDS balance mismatch after locking");
-
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking");
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(lock_amount, common::YEAR),
+        common::day_decline_of(lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after locking"
+    );
     let lock: Lock = velords.get_lock_for(blobert);
     assert_eq!(lock.amount, lock_amount.try_into().unwrap(), "lock amount mismatch");
     assert_eq!(lock.end_time, common::floor_to_week(unlock_time), "unlock time mismatch");
-// TODO: test events
+    // TODO: test events
 }
 
 #[test]
 fn test_create_new_lock_capped_4y_pass() {
     let (velords, lords) = common::velords_setup();
     let velords_token = IERC20Dispatcher { contract_address: velords.contract_address };
-
     let blobert: ContractAddress = common::blobert();
+    common::setup_for_blobert(lords.contract_address, velords.contract_address);
+
     let balance: u256 = 10_000_000 * common::ONE;
-
-    common::fund_lords(blobert, Option::Some(balance));
-
     let lock_amount: u256 = 2_000_000 * common::ONE;
     let now = get_block_timestamp();
     let unlock_time: u64 = now + 20 * common::YEAR;
     let capped_unlock_time: u64 = now + 4 * common::YEAR;
-
-    // blobert allows veLords contract to transfer its LORDS
-    start_prank(CheatTarget::One(lords.contract_address), blobert);
-    lords.approve(velords.contract_address, lock_amount);
-    stop_prank(CheatTarget::One(lords.contract_address));
 
     // blobert locks 2M LORDS for 20 years, will be capped to 4
     start_prank(CheatTarget::One(velords.contract_address), blobert);
     velords.manage_lock(lock_amount, unlock_time, blobert);
 
     assert_eq!(lords.balance_of(blobert), balance - lock_amount, "LORDS balance mismatch after locking");
-    assert_eq!(velords_token.total_supply(), lock_amount, "total supply mismatch after locking");
-    // TODO
-    // assert_eq!(velords_token.balance_of(blobert), lock_amount, "veLORDS balance mismatch after locking");
-
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking");
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(lock_amount, 4 * common::YEAR),
+        common::day_decline_of(lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after locking"
+    );
     let lock: Lock = velords.get_lock_for(blobert);
     assert_eq!(lock.amount, lock_amount.try_into().unwrap(), "lock amount mismatch");
     assert_eq!(lock.end_time, common::floor_to_week(capped_unlock_time), "unlock time mismatch");
@@ -184,10 +170,221 @@ fn test_create_new_lock_for_others_fail() {
 
     velords.manage_lock(lock_amount, unlock_time, blobert);
 }
-// test modifying lock
-//   pass w/ new amount and new time
-//   fail when shortening lock time
-//   fail modifying expired
-//   pass when modifying amount for someone else
-//   fail when modifying time for someone else
-//   fail on expired
+
+#[test]
+fn test_modify_lock_new_amount_and_time_pass() {
+    let (velords, lords) = common::velords_setup();
+    let velords_token = IERC20Dispatcher { contract_address: velords.contract_address };
+    let blobert: ContractAddress = common::blobert();
+    common::setup_for_blobert(lords.contract_address, velords.contract_address);
+
+    let balance: u256 = 10_000_000 * common::ONE;
+    let lock_amount: u256 = 2_000_000 * common::ONE;
+    let now = get_block_timestamp();
+    let unlock_time: u64 = now + common::YEAR;
+
+    // blobert locks 2M LORDS for 1 year
+    start_prank(CheatTarget::One(velords.contract_address), blobert);
+    velords.manage_lock(lock_amount, unlock_time, blobert);
+
+    assert_eq!(lords.balance_of(blobert), balance - lock_amount, "LORDS balance mismatch after locking 1");
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking 1");
+
+    // blobert lock 1M more LORDS
+    let next_lock_amount: u256 = 1_000_000 * common::ONE;
+    let unlock_time: u64 = unlock_time + common::WEEK;
+    velords.manage_lock(next_lock_amount, unlock_time, blobert);
+
+    let total_lock_amount: u256 = lock_amount + next_lock_amount;
+    assert_eq!(lords.balance_of(blobert), balance - total_lock_amount, "LORDS balance mismatch after locking 2");
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking 2");
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(total_lock_amount, common::YEAR + common::WEEK),
+        common::day_decline_of(total_lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after locking 2"
+    );
+    let lock: Lock = velords.get_lock_for(blobert);
+    assert_eq!(lock.amount, total_lock_amount.try_into().unwrap(), "lock amount mismatch 2");
+    assert_eq!(lock.end_time, common::floor_to_week(unlock_time), "unlock time mismatch 2");
+
+    // blobert extends the lock by 1 more year
+    let unlock_time: u64 = unlock_time + common::YEAR;
+    velords.manage_lock(0, unlock_time, blobert);
+
+    assert_eq!(lords.balance_of(blobert), balance - total_lock_amount, "LORDS balance mismatch after locking 3");
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking 3");
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(total_lock_amount, common::YEAR * 2 + common::WEEK),
+        common::day_decline_of(total_lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after locking 3"
+    );
+    let lock: Lock = velords.get_lock_for(blobert);
+    assert_eq!(lock.amount, total_lock_amount.try_into().unwrap(), "lock amount mismatch 3");
+    assert_eq!(lock.end_time, common::floor_to_week(unlock_time), "unlock time mismatch 3");
+
+    // blobert adds 3M more LORDS and extends the lock by 1 more year
+    let next_lock_amount: u256 = 3_000_000 * common::ONE;
+    let unlock_time: u64 = unlock_time + common::YEAR;
+    velords.manage_lock(next_lock_amount, unlock_time, blobert);
+
+    let total_lock_amount: u256 = total_lock_amount + next_lock_amount;
+    assert_eq!(lords.balance_of(blobert), balance - total_lock_amount, "LORDS balance mismatch after locking 4");
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking 4");
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(total_lock_amount, common::YEAR * 3 + common::WEEK),
+        common::day_decline_of(total_lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after locking 4"
+    );
+    let lock: Lock = velords.get_lock_for(blobert);
+    assert_eq!(lock.amount, total_lock_amount.try_into().unwrap(), "lock amount mismatch 4");
+    assert_eq!(lock.end_time, common::floor_to_week(unlock_time), "unlock time mismatch 4");
+}
+
+#[test]
+#[should_panic(expected: "unlock time must be in the future")]
+fn test_unlock_time_in_past_fail() {
+    let (velords, lords) = common::velords_setup();
+    let blobert: ContractAddress = common::blobert();
+    common::setup_for_blobert(lords.contract_address, velords.contract_address);
+
+    let lock_amount: u256 = 2_000_000 * common::ONE;
+    let now = get_block_timestamp();
+    let unlock_time: u64 = now - common::DAY;
+
+    // blobert tries to lock in the past
+    start_prank(CheatTarget::One(velords.contract_address), blobert);
+    velords.manage_lock(lock_amount, unlock_time, blobert);
+}
+
+#[test]
+#[should_panic(expected: "new unlock time must be greater than current unlock time")]
+fn test_shorten_lock_time_fail() {
+    let (velords, lords) = common::velords_setup();
+    let blobert: ContractAddress = common::blobert();
+    common::setup_for_blobert(lords.contract_address, velords.contract_address);
+
+    let balance: u256 = 10_000_000 * common::ONE;
+    let lock_amount: u256 = 2_000_000 * common::ONE;
+    let now = get_block_timestamp();
+    let unlock_time: u64 = now + common::YEAR;
+
+    // blobert locks 2M LORDS for 1 year
+    start_prank(CheatTarget::One(velords.contract_address), blobert);
+    velords.manage_lock(lock_amount, unlock_time, blobert);
+
+    // sanity check
+    assert_eq!(lords.balance_of(blobert), balance - lock_amount, "LORDS balance mismatch after locking");
+
+    // blobert tries to shorten the lock time
+    velords.manage_lock(0, unlock_time - common::DAY, blobert);
+}
+
+#[test]
+#[should_panic(expected: "cannot modify an expired lock")]
+fn test_modifying_expired_lock_fail() {
+    let (velords, lords) = common::velords_setup();
+    let blobert: ContractAddress = common::blobert();
+    common::setup_for_blobert(lords.contract_address, velords.contract_address);
+
+    let lock_amount: u256 = 2_000_000 * common::ONE;
+    let now = get_block_timestamp();
+    let unlock_time: u64 = now + common::WEEK * 4;
+
+    // blobert locks 2M LORDS for 4 weeks
+    start_prank(CheatTarget::One(velords.contract_address), blobert);
+    velords.manage_lock(lock_amount, unlock_time, blobert);
+
+    // sanity check
+    let lock: Lock = velords.get_lock_for(blobert);
+    assert_eq!(lock.amount, lock_amount.try_into().unwrap(), "lock amount mismatch");
+    assert_eq!(lock.end_time, common::floor_to_week(unlock_time), "unlock time mismatch");
+
+    // move time forward 2 months, lock is expired
+    start_warp(CheatTarget::All, now + common::WEEK * 8);
+
+    // blobert tries to lock 2M more LORDS for 1 year
+    velords.manage_lock(lock_amount, now + common::YEAR, blobert);
+}
+
+#[test]
+fn test_modify_lock_amount_by_non_owner_pass() {
+    let (velords, lords) = common::velords_setup();
+    let velords_token = IERC20Dispatcher { contract_address: velords.contract_address };
+    let blobert: ContractAddress = common::blobert();
+    common::setup_for_blobert(lords.contract_address, velords.contract_address);
+
+    let lock_amount: u256 = 2_000_000 * common::ONE;
+    let now = get_block_timestamp();
+    let unlock_time: u64 = now + common::YEAR;
+
+    // blobert locks 2M LORDS for 1 year
+    start_prank(CheatTarget::One(velords.contract_address), blobert);
+    velords.manage_lock(lock_amount, unlock_time, blobert);
+
+    // sanity check
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking 1");
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(lock_amount, common::YEAR),
+        common::day_decline_of(lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after locking 1"
+    );
+
+    // loaf adds 2M LORDS to blobert's lock
+    let loaf: ContractAddress = common::loaf();
+    let amount_added: u256 = 2_000_000 * common::ONE;
+    common::fund_lords(loaf, Option::Some(amount_added));
+
+    start_prank(CheatTarget::One(lords.contract_address), loaf);
+    lords.approve(velords.contract_address, amount_added);
+    stop_prank(CheatTarget::All);
+    start_prank(CheatTarget::One(velords.contract_address), loaf);
+    velords.manage_lock(amount_added, 0, blobert);
+
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking 2");
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(lock_amount + amount_added, common::YEAR),
+        common::day_decline_of(lock_amount + amount_added) * 7,
+        "blobert's veLORDS balance mismatch after locking 2"
+    );
+    // TODO: events
+}
+
+#[test]
+fn test_modify_lock_time_by_non_owner_noop() {
+    let (velords, lords) = common::velords_setup();
+    let velords_token = IERC20Dispatcher { contract_address: velords.contract_address };
+    let blobert: ContractAddress = common::blobert();
+    common::setup_for_blobert(lords.contract_address, velords.contract_address);
+
+    let lock_amount: u256 = 2_000_000 * common::ONE;
+    let now = get_block_timestamp();
+    let unlock_time: u64 = now + common::YEAR;
+
+    // blobert locks 2M LORDS for 1 year
+    start_prank(CheatTarget::One(velords.contract_address), blobert);
+    velords.manage_lock(lock_amount, unlock_time, blobert);
+
+    // sanity check
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking 1");
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(lock_amount, common::YEAR),
+        common::day_decline_of(lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after locking 1"
+    );
+
+    // badguy tries to extend the lock time, nothing happens
+    start_prank(CheatTarget::One(velords.contract_address), common::badguy());
+    velords.manage_lock(0, unlock_time + common::YEAR * 3, blobert);
+
+    let lock: Lock = velords.get_lock_for(blobert);
+    assert_eq!(lock.amount, lock_amount.try_into().unwrap(), "lock amount mismatch");
+    assert_eq!(lock.end_time, common::floor_to_week(unlock_time), "unlock time mismatch");
+}
+
+// test correct balance calc when time passes

@@ -398,6 +398,7 @@ mod velords {
             // if we want to do the same - what's REWARD_POOL for?
             //    reward pool is a pool for early exit penalties
             //    when adding, also add a getter for it
+            //    TODO: build dYFIRewardPool equivalent and hook it up
             //    TODO: emit Penalty
             // }
 
