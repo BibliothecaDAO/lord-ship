@@ -20,3 +20,10 @@ pub trait IERC20<TContractState> {
         ref self: TContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256
     ) -> bool;
 }
+
+#[starknet::interface]
+pub trait IERC20Ext<TContractState> {
+    fn burn(ref self: TContractState, amount: u256);
+    fn burn_from(ref self: TContractState, owner: ContractAddress, amount: u256);
+    fn mint(ref self: TContractState, recipient: ContractAddress, amount: u256);
+}
