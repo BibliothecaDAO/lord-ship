@@ -387,4 +387,76 @@ fn test_modify_lock_time_by_non_owner_noop() {
     assert_eq!(lock.end_time, common::floor_to_week(unlock_time), "unlock time mismatch");
 }
 
-// test correct balance calc when time passes
+#[test]
+fn test_locked_balance_progression() {
+    // TODO: this test fails, fix it
+
+    let (velords, lords) = common::velords_setup();
+    let velords_token = IERC20Dispatcher { contract_address: velords.contract_address };
+    let blobert: ContractAddress = common::blobert();
+    common::setup_for_blobert(lords.contract_address, velords.contract_address);
+
+    let balance: u256 = 10_000_000 * common::ONE;
+    let lock_amount: u256 = 2_000_000 * common::ONE;
+    let now = get_block_timestamp();
+    let start = now;
+    let unlock_time: u64 = now + common::YEAR * 2;
+
+    // blobert locks 2M LORDS for 2 years
+    start_prank(CheatTarget::One(velords.contract_address), blobert);
+    velords.manage_lock(lock_amount, unlock_time, blobert);
+
+    assert_eq!(lords.balance_of(blobert), balance - lock_amount, "LORDS balance mismatch after locking");
+    assert_eq!(velords_token.total_supply(), velords_token.balance_of(blobert), "total supply mismatch after locking");
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(lock_amount, common::YEAR * 2),
+        common::day_decline_of(lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after locking"
+    );
+
+    // move time forward by ~0.5y
+    let now: u64 = start + common::YEAR / 2;
+    let time_remaining: u64 = common::YEAR * 2 - common::YEAR / 2;
+    start_warp(CheatTarget::All, now);
+
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(lock_amount, time_remaining),
+        common::day_decline_of(lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after 0.5y"
+    );
+
+    // move time forward to 1y till lock expiry
+    let now: u64 = start + common::YEAR;
+    let time_remaining: u64 = common::YEAR;
+    start_warp(CheatTarget::All, now);
+
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(lock_amount, time_remaining),
+        common::day_decline_of(lock_amount) * 7,
+        "blobert's veLORDS balance mismatch after 1y"
+    );
+
+    // move time 1w before expiry
+    let now: u64 = start + common::YEAR * 2 - common::WEEK;
+    let time_remaining: u64 = common::WEEK;
+    start_warp(CheatTarget::All, now);
+
+    assert_approx(
+        velords_token.balance_of(blobert),
+        common::lock_balance(lock_amount, time_remaining),
+        common::day_decline_of(lock_amount) * 7,
+        "blobert's veLORDS balance mismatch 1w before expiry"
+    );
+
+
+    // move time 1w after expiry
+    let now: u64 = start + common::YEAR * 2 + common::WEEK;
+    start_warp(CheatTarget::All, now);
+
+    assert_eq!(velords_token.balance_of(blobert), 0, "blobert's veLORDS balance mismatch after expiry");
+}
+
+// test other public fns

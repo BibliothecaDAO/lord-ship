@@ -583,7 +583,7 @@ mod velords {
                 } else {
                     d_slope = self.slope_changes.read((owner, t_i));
                 }
-                upoint.bias == upoint.slope * (t_i - upoint.ts).into();
+                upoint.bias -= upoint.slope * (t_i - upoint.ts).into();
                 if t_i == ts {
                     break;
                 }
