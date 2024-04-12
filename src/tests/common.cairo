@@ -1,7 +1,7 @@
 use lordship::interfaces::IERC20::{IERC20Dispatcher, IERC20DispatcherTrait};
 use lordship::interfaces::IVE::{IVEDispatcher, IVEDispatcherTrait};
 use snforge_std::{ContractClass, ContractClassTrait, CheatTarget, declare, start_prank, start_warp, stop_prank};
-use starknet::{ContractAddress, contract_address_const};
+use starknet::{ContractAddress, get_block_timestamp, contract_address_const};
 
 pub const ONE: u256 = 1000000000000000000; // 10**18
 const LORDS_SUPPLY: u256 = 500_000_000 * ONE; // 500M LORDS
@@ -14,6 +14,10 @@ const MAX_LOCK: u64 = 4 * YEAR;
 
 pub fn lords_owner() -> ContractAddress {
     contract_address_const::<'lords owner'>()
+}
+
+pub fn dlords_owner() -> ContractAddress {
+    contract_address_const::<'dlords owner'>()
 }
 
 pub fn velords_owner() -> ContractAddress {
@@ -53,18 +57,37 @@ pub fn deploy_lords() -> ContractAddress {
     cls.deploy_at(@calldata, LORDS()).expect('lords deploy failed')
 }
 
+pub fn deploy_dlords() -> ContractAddress {
+    let cls = declare("dlords");
+    let calldata: Array<felt252> = array![dlords_owner().into()];
+    cls.deploy(@calldata).expect('dlords deploy failed')
+}
+
 pub fn deploy_velords() -> ContractAddress {
     let cls = declare("velords");
     let calldata: Array<felt252> = array![velords_owner().into()];
     cls.deploy(@calldata).expect('velords deploy failed')
 }
 
+pub fn deploy_reward_pool(velords: ContractAddress, dlords: ContractAddress) -> ContractAddress {
+    let cls = declare("dlords_reward_pool");
+    let calldata: Array<felt252> = array![velords.into(), dlords.into(), get_block_timestamp().into()];
+    cls.deploy(@calldata).expect('reward pool deploy failed')
+}
+
 pub fn velords_setup() -> (IVEDispatcher, IERC20Dispatcher) {
-    let velords = IVEDispatcher { contract_address: deploy_velords() };
-    let lords = IERC20Dispatcher { contract_address: deploy_lords() };
     start_warp(CheatTarget::All, TS);
 
-    (velords, lords)
+    let lords: ContractAddress = deploy_lords();
+    let velords: ContractAddress = deploy_velords();
+    let dlords: ContractAddress = deploy_dlords();
+    let reward_pool: ContractAddress = deploy_reward_pool(velords, dlords);
+
+    start_prank(CheatTarget::One(velords), velords_owner());
+    IVEDispatcher { contract_address: velords }.set_reward_pool(reward_pool);
+    stop_prank(CheatTarget::One(velords));
+
+    (IVEDispatcher { contract_address: velords }, IERC20Dispatcher { contract_address: lords })
 }
 
 pub fn fund_lords(recipient: ContractAddress, amount: Option<u256>) {

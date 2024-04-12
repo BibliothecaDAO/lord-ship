@@ -460,3 +460,4 @@ fn test_locked_balance_progression() {
 }
 
 // test other public fns
+// test withdrawal - interacts with reward pool

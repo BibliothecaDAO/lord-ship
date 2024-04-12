@@ -51,6 +51,7 @@ mod velords {
     use core::num::traits::Zero;
     use lordship::interfaces::IERC20::{IERC20, IERC20Dispatcher, IERC20DispatcherTrait};
     use lordship::interfaces::IVE::IVE;
+    use lordship::interfaces::IDLordsRewardPool::{IDLordsRewardPoolDispatcher, IDLordsRewardPoolDispatcherTrait};
     use openzeppelin::access::ownable::OwnableComponent;
     use openzeppelin::upgrades::UpgradeableComponent;
     use openzeppelin::upgrades::interface::IUpgradeable;
@@ -83,6 +84,9 @@ mod velords {
         #[substorage(v0)]
         upgradeable: UpgradeableComponent::Storage,
         // TODO: better docstrings
+
+        // pool for early exit penalties
+        reward_pool: IDLordsRewardPoolDispatcher,
 
         balances: LegacyMap<ContractAddress, u256>,
         supply: u128,
@@ -275,6 +279,10 @@ mod velords {
             self.slope_changes.read((owner, ts))
         }
 
+        fn get_reward_pool(self: @ContractState) -> ContractAddress {
+            self.reward_pool.read().contract_address
+        }
+
         fn find_epoch_by_timestamp(self: @ContractState, owner: ContractAddress, ts: u64) -> u64 {
             self.find_epoch_by_timestamp_internal(owner, ts, self.epoch.read(owner))
         }
@@ -393,19 +401,23 @@ mod velords {
 
             // transfer
             LORDS().transfer(caller, (locked.amount - penalty).into());
-            // if penalty.is_non_zero() {
-            // VotingYFI burns penalty here, figure out
-            // if we want to do the same - what's REWARD_POOL for?
-            //    reward pool is a pool for early exit penalties
-            //    when adding, also add a getter for it
-            //    TODO: build dYFIRewardPool equivalent and hook it up
-            //    TODO: emit Penalty
-            // }
+
+            if penalty.is_non_zero() {
+                let reward_pool = self.reward_pool.read();
+                LORDS().approve(reward_pool.contract_address, penalty.into());
+                reward_pool.burn(penalty.into());
+                // TODO: log Penalty
+            }
 
             self.emit(Withdraw { caller, amount: locked.amount - penalty, block_timestamp: now });
             self.emit(Supply { old_amount: old_supply, new_amount: old_supply - locked.amount, block_timestamp: now });
 
             (locked.amount - penalty, penalty)
+        }
+
+        fn set_reward_pool(ref self: ContractState, reward_pool: ContractAddress) {
+            self.ownable.assert_only_owner();
+            self.reward_pool.write(IDLordsRewardPoolDispatcher { contract_address: reward_pool });
         }
     }
 
