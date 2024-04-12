@@ -1,12 +1,14 @@
 mod dlords;
+mod dlords_reward_pool;
 mod velords;
 
 pub mod interfaces {
     pub mod IERC20;
     pub mod IVE;
+    pub mod IDLordsRewardPool;
 }
 
-//#[cfg(test)]
+// only used in tests, but can't be #[cfg(test)]
 pub mod mocks {
     pub mod erc20;
 }
