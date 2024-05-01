@@ -1,10 +1,4 @@
-// TODO: can the while loops go longer than 40 or 50?
-
-// TODO: docs, functions and storage vars
-
-// TODO: events
-
-// TODO: ownable, upgradable?
+// veYFI's dYFIRewardPool contract ported to Cairo
 
 #[starknet::contract]
 mod dlords_reward_pool {
@@ -14,33 +8,91 @@ mod dlords_reward_pool {
     use lordship::interfaces::IERC20::{IERC20Dispatcher, IERC20DispatcherTrait};
     use lordship::interfaces::IVE::{IVEDispatcher, IVEDispatcherTrait};
     use lordship::interfaces::IDLordsRewardPool::IDLordsRewardPool;
-    use lordship::velords::Point; // TODO: move to a shared types file?
-    use starknet::{ContractAddress, get_block_timestamp, get_caller_address, get_contract_address};
+    use lordship::velords::Point;
+    use openzeppelin::access::ownable::OwnableComponent;
+    use openzeppelin::upgrades::UpgradeableComponent;
+    use openzeppelin::upgrades::interface::IUpgradeable;
+    use starknet::{ClassHash, ContractAddress, get_block_timestamp, get_caller_address, get_contract_address};
 
     const DAY: u64 = 3600 * 24;
     const WEEK: u64 = DAY * 7;
     const TOKEN_CHECKPOINT_DEADLINE: u64 = DAY;
+    const ITERATION_LIMIT: u32 = 200;
+
+    component!(path: OwnableComponent, storage: ownable, event: OwnableEvent);
+    component!(path: UpgradeableComponent, storage: upgradeable, event: UpgradeableEvent);
+
+    #[abi(embed_v0)]
+    impl OwnableTwoStepImpl = OwnableComponent::OwnableTwoStepImpl<ContractState>;
+
+    impl OwnableInternalImpl = OwnableComponent::InternalImpl<ContractState>;
+    impl UpgradeableInternalImpl = UpgradeableComponent::InternalImpl<ContractState>;
 
     #[storage]
     struct Storage {
-        // TODO: docs
+        // component storage
+        #[substorage(v0)]
+        ownable: OwnableComponent::Storage,
+        #[substorage(v0)]
+        upgradeable: UpgradeableComponent::Storage,
+
         dlords: IERC20Dispatcher,
         velords: IVEDispatcher,
 
+        // Epoch time when fee distribution starts
         start_time: u64,
+        // Epoch when the last token checkpoint was made
         time_cursor: u64,
+        // Mapping between addresses and their last token checkpoint epoch
         time_cursor_of: LegacyMap<ContractAddress, u64>,
-
+        // Timestamp when the last checkpoint was made
         last_token_time: u64,
+        // Mapping between epoch and the total number of tokens distributed in that week
         tokens_per_week: LegacyMap<u64, u256>,
-
         token_last_balance: u256,
-        // ve_supply key is a timestamp (week cursor)
+        // Mapping between epoch and the total veLORDS supply at that epoch
+        // epoch -> veLORDS supply
         ve_supply: LegacyMap<u64, u256>
     }
 
+    #[event]
+    #[derive(Drop, starknet::Event)]
+    pub enum Event {
+        #[flat]
+        OwnableEvent: OwnableComponent::Event,
+        #[flat]
+        UpgradeableEvent: UpgradeableComponent::Event,
+        CheckpointToken: CheckpointToken,
+        Claimed: Claimed,
+        RewardReceived: RewardReceived
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct CheckpointToken {
+        time: u64,
+        tokens: u256
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct Claimed {
+        #[key]
+        pub recipient: ContractAddress,
+        amount: u256,
+        claim_epoch: u64,
+        max_epoch: u64
+    }
+
+    #[derive(Drop, starknet::Event)]
+    pub struct RewardReceived {
+        #[key]
+        pub sender: ContractAddress,
+        amount: u256
+    }
+
     #[constructor]
-    fn constructor(ref self: ContractState, velords: ContractAddress, dlords: ContractAddress, start_time: u64) {
+    fn constructor(ref self: ContractState, owner: ContractAddress, velords: ContractAddress, dlords: ContractAddress, start_time: u64) {
+        self.ownable.initializer(owner);
+
         self.velords.write(IVEDispatcher { contract_address: velords });
         self.dlords.write(IERC20Dispatcher { contract_address: dlords });
 
@@ -48,8 +100,14 @@ mod dlords_reward_pool {
         self.start_time.write(t);
         self.last_token_time.write(t);
         self.time_cursor.write(t);
+    }
 
-        // TODO: log init event? do we want it?
+    #[abi(embed_v0)]
+    impl UpgradeableImpl of IUpgradeable<ContractState> {
+        fn upgrade(ref self: ContractState, new_class_hash: ClassHash) {
+            self.ownable.assert_only_owner();
+            self.upgradeable._upgrade(new_class_hash);
+        }
     }
 
     #[abi(embed_v0)]
@@ -82,6 +140,7 @@ mod dlords_reward_pool {
             self.ve_supply.read(week)
         }
 
+        /// Receive dYFI into the contract and update token checkpoint.
         fn burn(ref self: ContractState, amount: u256) {
             let caller: ContractAddress = get_caller_address();
             let this: ContractAddress = get_contract_address();
@@ -95,22 +154,33 @@ mod dlords_reward_pool {
 
             if amount.is_non_zero() {
                 dlords.transfer_from(caller, this, amount);
-                // TODO: emit RewardReceived
+                self.emit(RewardReceived { sender: caller, amount });
+
                 if get_block_timestamp() > self.last_token_time.read() + TOKEN_CHECKPOINT_DEADLINE {
                     self.checkpoint_token_internal();
                 }
             }
         }
 
+        /// Update the token checkpoint.
+        /// Calculates the total number of tokens to be distributed in a given week.
         fn checkpoint_token(ref self: ContractState) {
             assert!(get_block_timestamp() > self.last_token_time.read() + TOKEN_CHECKPOINT_DEADLINE, "Token checkpoint deadline not yet reached");
             self.checkpoint_token_internal();
         }
 
+        /// Update the veLORDS total supply checkpoint.
+        /// The checkpoint is also updated by the first claimant each new epoch. This fn
+        /// can be called independently of a claim to reduce claiming gas costs.
         fn checkpoint_total_supply(ref self: ContractState) {
             self.checkpoint_total_supply_internal();
         }
 
+        /// Claim for an address.
+        /// Each call to claim looks at max of 200 veLORDS checkpoints. This function may need
+        /// to be called multiple times to claim all available fees. In the `Claimed` event
+        /// this function emits, if the `claim_epoch` is less than `max_epoch`, the address
+        /// may claim again.
         fn claim(ref self: ContractState, recipient: ContractAddress) -> u256 {
             let now: u64 = get_block_timestamp();
 
@@ -143,7 +213,7 @@ mod dlords_reward_pool {
 
             if to_distribute.is_zero() {
                 self.last_token_time.write(now);
-                // TODO: emit CheckpointToken
+                self.emit(CheckpointToken { time: now, tokens: 0 });
                 return;
             }
 
@@ -155,7 +225,7 @@ mod dlords_reward_pool {
             let mut next_week: u64 = 0;
             let mut i: u32 = 0;
 
-            while i < 40 {
+            while i < ITERATION_LIMIT {
                 next_week = this_week + WEEK;
                 let tpw = self.tokens_per_week.read(this_week);
 
@@ -176,8 +246,9 @@ mod dlords_reward_pool {
 
                 t = next_week;
                 this_week = next_week;
-            }
-            // TODO: log CheckpointToken
+            };
+
+            self.emit(CheckpointToken { time: now, tokens: to_distribute })
         }
 
         fn checkpoint_total_supply_internal(ref self: ContractState) {
@@ -187,7 +258,7 @@ mod dlords_reward_pool {
             velords.checkpoint();
 
             let mut i: u32 = 0;
-            while i < 40 {
+            while i < ITERATION_LIMIT {
                 if t > rounded_ts {
                     break;
                 }
@@ -234,7 +305,7 @@ mod dlords_reward_pool {
             }
 
             let mut i: u32 = 0;
-            while i < 50 {
+            while i < ITERATION_LIMIT {
                 if week_cursor >= last_token_time {
                     break;
                 }
@@ -247,7 +318,8 @@ mod dlords_reward_pool {
             };
 
             self.time_cursor_of.write(recipient, week_cursor);
-            // TODO: log Claimed
+
+            self.emit(Claimed { recipient, amount: to_distribute, claim_epoch: week_cursor, max_epoch: max_user_epoch });
 
             to_distribute
         }
