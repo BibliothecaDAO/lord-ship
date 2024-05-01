@@ -1,12 +1,4 @@
-// TODO: SRC5
-//       compare VotingYFI with veANGLE.vy & crv VotingEscrow.vy
-//       test suite
-//       validate input args
-
-// TODO: in VotingYFI/veANGLE it's LockedBalance.amount is int128, why? why not uint128?
-//       we're using uint128, can the locked balance be negative?
-
-// TODO: doc comments everywhere
+// veYFI's VotingYFI contract ported to Cairo
 
 const TWO_POW_64: felt252 = 0x10000000000000000;
 const TWO_POW_128: felt252 = 0x100000000000000000000000000000000;
@@ -79,23 +71,25 @@ mod velords {
 
     #[storage]
     struct Storage {
+        // component storage
         #[substorage(v0)]
         ownable: OwnableComponent::Storage,
         #[substorage(v0)]
         upgradeable: UpgradeableComponent::Storage,
-        // TODO: better docstrings
 
         // pool for early exit penalties
         reward_pool: IDLordsRewardPoolDispatcher,
-
-        balances: LegacyMap<ContractAddress, u256>,
+        // stores total amount of LORDS locked
         supply: u128,
-        // owner -> lock details
+        // storing Lock details for an address
         locked: LegacyMap<ContractAddress, Lock>,
-        // 0,1,2...
+        // keeps track of address history
+        // address -> epoch
         epoch: LegacyMap<ContractAddress, u64>,
+        // stores global and per-address checkpoint data
         // (address, epoch) -> Point
         point_history: LegacyMap<(ContractAddress, u64), Point>,
+        // stores slope changes in time
         // (address, ts) -> signed slope change
         slope_changes: LegacyMap<(ContractAddress, u64), i128>,
     }
@@ -113,8 +107,6 @@ mod velords {
         Supply: Supply
     }
 
-    // TODO: do we need block_timestamp in the events? isn't that redundant?
-
     #[derive(Drop, starknet::Event)]
     pub struct ModifyLock {
         #[key]
@@ -123,7 +115,6 @@ mod velords {
         pub owner: ContractAddress,
         amount: u128,
         end_time: u64,
-        block_timestamp: u64
     }
 
     #[derive(Drop, starknet::Event)]
@@ -131,7 +122,6 @@ mod velords {
         #[key]
         pub caller: ContractAddress,
         amount: u128,
-        block_timestamp: u64
     }
 
     #[derive(Drop, starknet::Event)]
@@ -139,14 +129,12 @@ mod velords {
         #[key]
         pub caller: ContractAddress,
         amount: u128,
-        block_timestamp: u64
     }
 
     #[derive(Drop, starknet::Event)]
     pub struct Supply {
         old_amount: u128,
         new_amount: u128,
-        block_timestamp: u64
     }
 
     #[constructor]
@@ -179,6 +167,7 @@ mod velords {
             18
         }
 
+        /// Returns the current total voting power
         fn total_supply(self: @ContractState) -> u256 {
             self.balance_of_at(get_contract_address(), get_block_timestamp())
         }
@@ -225,24 +214,28 @@ mod velords {
 
     #[abi(embed_v0)]
     impl IVEImpl of IVE<ContractState> {
+        /// Get the current epoch for an address
         fn get_epoch_for(self: @ContractState, owner: ContractAddress) -> u64 {
             self.epoch.read(owner)
         }
 
+        /// Get a Lock of an address
         fn get_lock_for(self: @ContractState, owner: ContractAddress) -> Lock {
             self.locked.read(owner)
         }
 
-        // get the most recently recorded point for an owner
+        /// Get the most recently recorded point for an address
         fn get_last_point(self: @ContractState, owner: ContractAddress) -> Point {
             let epoch: u64 = self.epoch.read(owner);
             self.point_history.read((owner, epoch))
         }
 
+        /// Get a recorded Point for an address at a given epoch
         fn get_point_for_at(self: @ContractState, owner: ContractAddress, epoch: u64) -> Point {
             self.point_history.read((owner, epoch))
         }
 
+        /// Measures the voting power of an address at a given block height
         fn get_prior_votes(self: @ContractState, owner: ContractAddress, height: u64) -> u256 {
             assert!(height <= get_block_number(), "height must be less than or equal to current block number");
 
@@ -287,6 +280,7 @@ mod velords {
             self.find_epoch_by_timestamp_internal(owner, ts, self.epoch.read(owner))
         }
 
+        /// Calculate voting power of an address at given point in time
         fn balance_of_at(self: @ContractState, owner: ContractAddress, ts: u64) -> u256 {
             let mut epoch: u64 = self.epoch.read(owner);
             if epoch.is_zero() {
@@ -302,6 +296,7 @@ mod velords {
             balance.into()
         }
 
+        /// Calculate the total voting power at a given point in time
         fn total_supply_at(self: @ContractState, height: u64) -> u256 {
             let current_block: u64 = get_block_number();
             assert!(height <= current_block, "height must be less than or equal to current block number");
@@ -329,8 +324,9 @@ mod velords {
             supply.into()
         }
 
-        // create or modify a lock for a user
-        // supports deposits on behalf of a user
+        /// Create or modify a lock.
+        /// Supports deposits on behalf of an address.
+        /// Max lock time is 4 years. Lock duration and amount can only be increased.
         fn manage_lock(ref self: ContractState, amount: u256, unlock_time: u64, owner: ContractAddress) {
             let amount: u128 = amount.try_into().expect('amount overflow');
             let old_lock: Lock = self.locked.read(owner);
@@ -371,14 +367,19 @@ mod velords {
                 LORDS().transfer_from(caller, get_contract_address(), amount.into());
             }
 
-            self.emit(Supply { old_amount: old_supply, new_amount: old_supply + amount, block_timestamp: now });
-            self.emit(ModifyLock { caller, owner, amount: new_lock.amount, end_time: new_lock.end_time, block_timestamp: now });
+            self.emit(Supply { old_amount: old_supply, new_amount: old_supply + amount });
+            self.emit(ModifyLock { caller, owner, amount: new_lock.amount, end_time: new_lock.end_time });
         }
 
+        /// Record global data to checkpoint
         fn checkpoint(ref self: ContractState) {
             self.checkpoint_internal(Zero::zero(), @Default::default(), @Default::default());
         }
 
+        /// Remove a lock.
+        /// If the lock has expired, return the full amount to caller.
+        /// If the lock is still active, caller will pay a penalty of 75% of locked amount
+        /// in the first year (of max) and a lineary decreasing from 75% to 0 for the remaining time.
         fn withdraw(ref self: ContractState) -> (u128, u128) {
             let caller: ContractAddress = get_caller_address();
             let locked: Lock = self.locked.read(caller);
@@ -387,7 +388,7 @@ mod velords {
             let now: u64 = get_block_timestamp();
             let penalty: u128 = if locked.end_time > now {
                 let time_left: u64 = locked.end_time - now;
-                let penalty_ratio: u128 = min((time_left * SCALE).into(), MAX_PENALTY_RATIO);
+                let penalty_ratio: u128 = min((time_left * SCALE / MAX_LOCK_DURATION).into(), MAX_PENALTY_RATIO);
                 locked.amount * penalty_ratio / SCALE.into()
             } else {
                 0
@@ -406,11 +407,11 @@ mod velords {
                 let reward_pool = self.reward_pool.read();
                 LORDS().approve(reward_pool.contract_address, penalty.into());
                 reward_pool.burn(penalty.into());
-                // TODO: log Penalty
+                self.emit(Penalty { caller, amount: penalty })
             }
 
-            self.emit(Withdraw { caller, amount: locked.amount - penalty, block_timestamp: now });
-            self.emit(Supply { old_amount: old_supply, new_amount: old_supply - locked.amount, block_timestamp: now });
+            self.emit(Withdraw { caller, amount: locked.amount - penalty });
+            self.emit(Supply { old_amount: old_supply, new_amount: old_supply - locked.amount });
 
             (locked.amount - penalty, penalty)
         }
